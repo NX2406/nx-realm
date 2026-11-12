@@ -67,7 +67,7 @@ nxr list
 ```bash
 nxr node add ix-hk 203.0.113.10        # 可加 --port 2222 --user ubuntu --jump 跳板节点
 nxr node key ix-hk
-nxr node test
+nxr node test                          # 不带名称时测全部节点，有一个失败就返回 1
 ```
 
 也可以在菜单"节点管理"里按向导添加，向导会自动完成公钥安装。
@@ -81,6 +81,7 @@ nxr chain add --name hk --hop local:11111 --hop ix-hk:22222 --target 10.0.0.1:33
 - `--hop` 按顺序写每一跳，`local` 表示本机（前置）。
 - `ix-hk:22222@203.0.113.10` 中 `@` 后面是上一跳连接本跳时使用的地址（默认取节点登记的地址），`%eth1` 可指定本跳出站网卡。
 - `--target` 是落地地址。
+- 部署完会逐跳检测一次。检测不通时规则照样保留（落地服务可能稍后才启动），命令返回 6，和部署失败的 1 区分开；排查后用 `nxr chain check 链路ID` 复查。
 
 ### 一个前置 · 多个 IX · 多个出口
 

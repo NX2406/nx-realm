@@ -8,7 +8,7 @@
 [ -z "${BASH_VERSION:-}" ] && { echo "请使用 bash 运行本脚本" >&2; exit 1; }
 if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then echo "需要 bash 4.0 及以上版本" >&2; exit 1; fi
 
-NXR_VERSION="1.2.1"
+NXR_VERSION="1.2.2"
 NXR_REPO="NX2406/nx-realm"
 NXR_RAW_URL="https://raw.githubusercontent.com/${NXR_REPO}/main/nxr.sh"
 REALM_REPO="zhboner/realm"
@@ -2491,11 +2491,16 @@ chain_deploy() {
   done
   chain_save "$cid" "$cname" "$proto" "$tmode" "$n"
   ok "链路 $cid 部署完成"
-  chain_check "$cid"
+  chain_check "$cid"; rc=$?
   CHAIN_ENTRY=$(chain_entry "$cid")
   if [[ $quiet != 1 ]]; then
     printf '\n  %s客户端连接地址：%s%s\n' "$C_GRN$C_BLD" "$CHAIN_ENTRY" "$C_RST"
     echo "  （客户端使用出口落地服务的协议参数，只把服务器地址/端口改成上面的入口）"
+  fi
+  # 检测不通不回滚（落地服务可能稍后才启动），用单独的返回码 6 和「部署失败」（1）区分
+  if [[ $rc -ne 0 ]]; then
+    warn "链路 $cid 已部署，但连通性检测未通过，规则已保留：排查后执行 nxr chain check $cid 复查，不需要时 nxr chain del $cid"
+    return 6
   fi
   return 0
 }
@@ -2855,11 +2860,12 @@ EOF
     C_TARGETS=$(targets_keep "${EXT[${LEX[i]}]}" "${ixs[@]}")
     CHAIN_USED=" "
     printf '\n  %s[%d/%d] 线路 %s%s\n' "$C_BLD" $((i + 1)) "${#LN[@]}" "${LN[i]}" "$C_RST"
-    if chain_deploy "$cid" "${LN[i]}" "$proto" "$tmode" 2 1; then
-      RES+=("${LN[i]}|$cid|$CHAIN_ENTRY|ok"); ok_lines=$((ok_lines + 1))
-    else
-      RES+=("${LN[i]}|-|-|fail")
-    fi
+    chain_deploy "$cid" "${LN[i]}" "$proto" "$tmode" 2 1
+    case $? in
+      0) RES+=("${LN[i]}|$cid|$CHAIN_ENTRY|ok"); ok_lines=$((ok_lines + 1)) ;;
+      6) RES+=("${LN[i]}|$cid|$CHAIN_ENTRY|check") ;;
+      *) RES+=("${LN[i]}|-|-|fail") ;;
+    esac
   done
 
   echo
@@ -2867,11 +2873,11 @@ EOF
   printf '  %s批量结果：成功 %d / %d%s\n' "$C_BLD" "$ok_lines" "${#LN[@]}" "$C_RST"
   for r in "${RES[@]}"; do
     IFS='|' read -r a b c d <<<"$r"
-    if [[ $d == ok ]]; then
-      printf '  %s✓%s %-20s %-4s 客户端连接 %s\n' "$C_GRN" "$C_RST" "$a" "$b" "$c"
-    else
-      printf '  %s✗%s %-20s 部署失败\n' "$C_RED" "$C_RST" "$a"
-    fi
+    case $d in
+      ok) printf '  %s✓%s %-20s %-4s 客户端连接 %s\n' "$C_GRN" "$C_RST" "$a" "$b" "$c" ;;
+      check) printf '  %s!%s %-20s %-4s 客户端连接 %s（已部署，连通性检测未通过）\n' "$C_YLW" "$C_RST" "$a" "$b" "$c" ;;
+      *) printf '  %s✗%s %-20s 部署失败\n' "$C_RED" "$C_RST" "$a" ;;
+    esac
   done
   echo "  （客户端使用对应出口落地服务的协议参数，服务器地址/端口改成上面的入口）"
   [[ $ok_lines -eq ${#LN[@]} ]]
@@ -2945,12 +2951,13 @@ rules_brief() {
   done
 }
 
+# pick_rule 变量名 [提示]：输入并校验规则端口。局部变量只用 __ 开头的名字：调用方传的变量（常见是 id）被同名 local 遮住时，结果写不回去
 pick_rule() {
-  local __v=$1 id
-  ask id "${2:-输入规则端口}" "" || return 1
-  [[ -z $id ]] && return 1
-  rule_exists "$id" || { err "规则不存在: $id"; return 1; }
-  printf -v "$__v" '%s' "$id"
+  local __v=$1 __id
+  ask __id "${2:-输入规则端口}" "" || return 1
+  [[ -z $__id ]] && return 1
+  rule_exists "$__id" || { err "规则不存在: $__id"; return 1; }
+  printf -v "$__v" '%s' "$__id"
 }
 
 rule_detail() {
@@ -3180,8 +3187,12 @@ menu_add() {
   case $c in 2) R_PROTO=tcp ;; 3) R_PROTO=udp ;; *) R_PROTO=both ;; esac
   ask R_NAME "备注名称（可选）" "" || return
   is_text "$R_NAME" || R_NAME=""
-  info "探测目标 $R_REMOTE"
-  if ms=$(tcp_probe "$host" "$rport" 3); then ok "目标可达，延迟 ${ms}ms"; else warn "目标暂时不可达（服务未启动或仅 UDP 时可忽略）"; fi
+  if [[ $R_PROTO == udp ]]; then
+    info "仅 UDP 规则，不探测目标 $R_REMOTE"
+  else
+    info "探测目标 $R_REMOTE"
+    if ms=$(tcp_probe "$host" "$rport" 3); then ok "目标可达，延迟 ${ms}ms"; else warn "目标 TCP 暂时不可达（服务未启动时可忽略）"; fi
+  fi
   if confirm "进入高级设置?（出站网卡/源IP、负载均衡、主备切换、加密传输、PROXY 协议、DNS）" N; then
     rule_editor || return
   fi
@@ -3400,7 +3411,9 @@ menu_probe() {
         for id in $(rule_ids); do
           rule_load "$id"
           split_hostport "$(rule_target)"
-          if ms=$(tcp_probe "$HP_HOST" "$HP_PORT" 3); then
+          if [[ $R_PROTO == udp ]]; then
+            printf '  %-6s → %-30s %s仅 UDP，不做探测%s\n' "$id" "$(rule_target)" "$C_GRY" "$C_RST"
+          elif ms=$(tcp_probe "$HP_HOST" "$HP_PORT" 3); then
             printf '  %-6s → %-30s %s%s ms%s\n' "$id" "$(rule_target)" "$C_GRN" "$ms" "$C_RST"
           else
             printf '  %-6s → %-30s %s不可达%s\n' "$id" "$(rule_target)" "$C_RED" "$C_RST"
@@ -3435,7 +3448,10 @@ rule_diag() {
   fi
   for t in "$R_REMOTE" ${R_EXTRA_REMOTES//,/ } ${R_BACKUPS//,/ }; do
     split_hostport "$t" || continue
-    if ms=$(tcp_probe "$HP_HOST" "$HP_PORT" 3); then ok "目标 $t 可达（${ms}ms）"; else err "目标 $t 不可达"; fi
+    # UDP 没有握手，探测不出目标在不在听；TCP+UDP 规则这里只代表 TCP 方向
+    if [[ $R_PROTO == udp ]]; then info "目标 $t 仅 UDP，不做探测"
+    elif ms=$(tcp_probe "$HP_HOST" "$HP_PORT" 3); then ok "目标 $t TCP 可达（${ms}ms）"
+    else err "目标 $t TCP 不可达"; fi
   done
   x=$(fw_backend)
   if [[ $x == none ]]; then
@@ -4191,13 +4207,13 @@ cli_hop_check() {
 }
 
 cli_node() {
-  local sub=${1:-list} n
+  local sub=${1:-list} n rc=0
   [[ $# -gt 0 ]] && shift
   case $sub in
     list)
       for n in $(node_names); do node_load "$n"; printf '%-14s %s\n' "$n" "$(node_label)"; done ;;
     test)
-      if [[ -n ${1:-} ]]; then node_test "$1"; else for n in $(node_names); do node_test "$n"; done; fi ;;
+      if [[ -n ${1:-} ]]; then node_test "$1"; else for n in $(node_names); do node_test "$n" || rc=1; done; return "$rc"; fi ;;
     add)
       node_reset
       N_NAME=${1:-}; N_HOST=${2:-}
